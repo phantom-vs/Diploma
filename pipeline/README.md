@@ -1,17 +1,16 @@
 # EEG preprocessing pipeline
 
-Конфигурируемая предобработка Nihon/MNE: разметка DEPD → CSV и индекс скользящих окон. Выход — папки с тегом варианта обработки (без отдельной БД).
+Конфигурируемая предобработка MNE: разметка DEPD → CSV и индекс скользящих окон. Выход — папки с тегом варианта обработки.
 
 ## Быстрый старт
 
 ```bash
 cd pipeline
 pip install -r requirements.txt
-# при необходимости поправьте eeg_path, output_root, recordings
 python run_preproc.py --config configs/preproc.yaml
 ```
 
-Редактируйте **`configs/preproc.yaml`**: `output_root`, список **`datasets`**, общий **`preprocessing`**.
+Редактируйте **`configs/preproc.yaml`**: output_root, root, eeg_path, preprocessing(опционально).
 
 ### Несколько датасетов (`datasets`)
 
@@ -23,7 +22,6 @@ python run_preproc.py --config configs/preproc.yaml
 
 Один и тот же список **`preprocessing`** применяется ко **всем** записям во **всех** датасетах.
 
-Устаревший (но поддерживаемый) вариант: верхнеуровневый **`recordings`**, у каждой строки своё поле **`dataset`**, `eeg_path` относительно каталога конфига. Нельзя смешивать **`datasets`** и **`recordings`** в одном файле.
 
 `output_root` задаётся относительно каталога конфига, если не абсолютный.
 
@@ -50,8 +48,6 @@ python run_preproc.py --config configs/preproc.yaml
 2. Импорт модуля в `preproc/postprocess/__init__.py`.
 3. Запись в YAML: `kind: your_kind`, `params: { ... }`.
 
-`ctx` содержит в том числе: `recording_id`, `dataset`, `subject_id`, `session_date`, `source_eeg_path`, `sfreq`, `n_times`, `depd_intervals`, `depd_annotations`.
+`ctx` содержит в том числе: `recording_id`, `dataset`, `subject_id`, `session_date`, `source_eeg_path`, `sfreq`, `n_times`, `depd_intervals`, `depd_annotations`.(just in case: если будем расширяешь код, то  открываешь шаблон постпроцессора и читаешь нужные ключи из ctx, например intervals = ctx["depd_intervals"]. Обычному запуску run_preproc.py ничего из этого вручную вводить не нужно.)
 
-## Зависимости
 
-См. `requirements.txt` (MNE, NumPy, Pandas, PyYAML).
