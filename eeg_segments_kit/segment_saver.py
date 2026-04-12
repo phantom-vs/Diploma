@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import mne
+import numpy as np
 
 from preprocessor import (
     apply_label_pipeline,
@@ -67,6 +68,71 @@ def _ensure_recording_id(cfg: dict[str, Any]) -> str:
     return uuid.uuid4().hex[:12]
 
 
+BIPOLAR_ANODES = [
+    "Fp1",
+    "Fp2",
+    "F3",
+    "F4",
+    "C3",
+    "C4",
+    "P3",
+    "P4",
+    "Fp1",
+    "Fp2",
+    "F7",
+    "F8",
+    "T3",
+    "T4",
+    "T5",
+    "T6",
+    "Fz",
+    "Cz",
+]
+BIPOLAR_CATHODES = [
+    "F3",
+    "F4",
+    "C3",
+    "C4",
+    "P3",
+    "P4",
+    "O1",
+    "O2",
+    "F7",
+    "F8",
+    "T3",
+    "T4",
+    "T5",
+    "T6",
+    "O1",
+    "O2",
+    "Cz",
+    "Pz",
+]
+
+
+def bipolar_channel_names() -> list[str]:
+    return [f"{a}-{c}" for a, c in zip(BIPOLAR_ANODES, BIPOLAR_CATHODES)]
+
+
+def cropped_raw_to_bipolar_float32(seg_raw: mne.io.BaseRaw) -> tuple[np.ndarray, list[str]]:
+    """Обрезанный монополярный Raw → (data float32 (18, n_times), имена биполярных каналов)."""
+    names = bipolar_channel_names()
+    data_chunk = seg_raw.get_data()
+    info = seg_raw.info.copy()
+    tmp_raw = mne.io.RawArray(data_chunk, info, verbose=False)
+    raw_bip = mne.set_bipolar_reference(
+        tmp_raw,
+        anode=BIPOLAR_ANODES,
+        cathode=BIPOLAR_CATHODES,
+        ch_name=names,
+        drop_refs=True,
+        copy=True,
+    )
+    raw_bip.pick(names)
+    seg_data = raw_bip.get_data().astype(np.float32)
+    return seg_data, names
+
+
 def export_recording_to_segments(
     eeg_path: str | Path,
     out_dir: str | Path,
@@ -74,7 +140,8 @@ def export_recording_to_segments(
 ) -> Path:
     """
     Главная точка входа: прочитать ЭЭГ, (опционально) обрезать по меткам региона,
-    нарезать на сегменты, сохранить FIF + meta.json на сегмент + export_manifest.json.
+    нарезать на сегменты, сохранить сжатый `.npz` (биполяр 18 каналов)
+    + `*_meta.json` на сегмент + `export_manifest.json`.
 
     cfg (основные поля):
       - segment_duration_sec: float (по умолчанию 300)
@@ -114,7 +181,7 @@ def export_recording_to_segments(
         duration_sec = n_times / sfreq
         # n_times/sfreq иногда чуть выше последней метки времени MNE → crop(tmax=...) падает
         t_max_raw = float(raw.times[-1])
-        ch_names = list(raw.ch_names)
+        stem = eeg_path.stem
 
         raw_anns = _raw_annotations_as_dicts(raw)
         piped = preprocess_annotation_descriptions(raw_anns, label_pipeline)
@@ -200,15 +267,24 @@ def export_recording_to_segments(
             t1 = min(t + seg_len, t_crop_hi, t_max_raw)
             if t1 <= t:
                 break
-            seg_name = f"seg_{seg_index:06d}"
-            seg_path = out_dir / seg_name
-            seg_path.mkdir(parents=True, exist_ok=True)
+            seg_tag = f"{stem}_seg{seg_index:03d}"
+            npz_rel = f"{seg_tag}.npz"
+            meta_rel = f"{seg_tag}_meta.json"
+            npz_abs = out_dir / npz_rel
+            meta_abs = out_dir / meta_rel
 
             seg_raw = raw.copy().crop(tmin=t, tmax=t1).load_data()
             try:
-                fif_rel = "segment_raw.fif"
-                fif_abs = seg_path / fif_rel
-                seg_raw.save(str(fif_abs), overwrite=True)
+                seg_data, seg_ch_names = cropped_raw_to_bipolar_float32(seg_raw)
+
+                np.savez_compressed(
+                    npz_abs,
+                    data=seg_data,
+                    sfreq=sfreq,
+                    t_start_sec=float(t),
+                    t_end_sec=float(t1),
+                    ch_names=np.array(seg_ch_names, dtype=object),
+                )
 
                 seg_intervals_ch = intervals_for_segment(intervals_by_channel, t, t1)
                 seg_intervals_gl = intervals_for_segment(intervals_global, t, t1)
@@ -216,13 +292,15 @@ def export_recording_to_segments(
                 meta = {
                     "version": 1,
                     "segment_index": seg_index,
-                    "segment_dir": seg_name,
+                    "segment_stem": seg_tag,
+                    "npz_file": npz_rel,
+                    "montage": "bipolar_18",
                     "tmin_global_sec": t,
                     "tmax_global_sec": t1,
                     "duration_sec": t1 - t,
                     "sfreq": sfreq,
-                    "n_channels": len(ch_names),
-                    "ch_names": ch_names,
+                    "n_channels": len(seg_ch_names),
+                    "ch_names": list(seg_ch_names),
                     "recording_id": recording_id,
                     "dataset": cfg.get("dataset"),
                     "subject_id": cfg.get("subject_id"),
@@ -235,19 +313,17 @@ def export_recording_to_segments(
                     "intervals_global": seg_intervals_gl,
                     "annotated_region_sec": [t_crop_lo, t_crop_hi],
                 }
-                meta_path = seg_path / "meta.json"
-                with meta_path.open("w", encoding="utf-8") as mf:
+                with meta_abs.open("w", encoding="utf-8") as mf:
                     json.dump(meta, mf, ensure_ascii=False, indent=2)
 
                 segments_meta.append(
                     {
                         "index": seg_index,
-                        "dir": seg_name,
                         "tmin_global_sec": t,
                         "tmax_global_sec": t1,
-                        "n_samples": int(seg_raw.n_times),
-                        "fif": str(Path(seg_name) / fif_rel),
-                        "meta": str(Path(seg_name) / "meta.json"),
+                        "n_samples": int(seg_data.shape[1]),
+                        "npz": npz_rel,
+                        "meta": meta_rel,
                     }
                 )
             finally:
@@ -257,9 +333,11 @@ def export_recording_to_segments(
             t = t1
 
         manifest = {
-            "version": 1,
+            "version": 2,
+            "storage": "npz_bipolar",
             "recording_id": recording_id,
             "source_eeg_path": str(eeg_path),
+            "eeg_stem": stem,
             "segment_duration_sec": segment_duration_sec,
             "n_segments": len(segments_meta),
             "sfreq": sfreq,
@@ -288,8 +366,6 @@ def build_windows_index_for_segment_meta(
     даёт один «канал» логики — здесь при use_global_intervals=True все depd_ch_i
     получают одно значение (есть ли пересечение с любым глобальным интервалом).
     """
-    import numpy as np
-
     sfreq = float(meta["sfreq"])
     dur = float(meta["duration_sec"])
     n_times = int(round(dur * sfreq))

@@ -11,7 +11,7 @@ OUT_ROOT = Path(__file__).resolve().parent.parent / "exports"
 
 JOBS = [
     {
-        "eeg": Path("/Users/vspyatochkin/diploma_dev/new_data/NKT/EEG2100/FA0183YD.EEG"),
+        "eeg": Path("/Users/vspyatochkin/diploma_dev/new_data/NKT/EEG2100/FA0183YC.EEG"),
         "subject_id": "FA0183YD",
         "recording_id": "FA0183YD_run1",
     },
