@@ -168,6 +168,95 @@ def global_intervals_from_markers(
     return intervals
 
 
+def _merge_touching_intervals(
+    intervals: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Склеить пересекающиеся или соприкасающиеся [start, end) в один список."""
+    if not intervals:
+        return []
+    srt = sorted(intervals, key=lambda x: (float(x["start"]), float(x["end"])))
+    out: list[dict[str, Any]] = [{"start": float(srt[0]["start"]), "end": float(srt[0]["end"])}]
+    for row in srt[1:]:
+        s, e = float(row["start"]), float(row["end"])
+        last = out[-1]
+        le = float(last["end"])
+        if s <= le + 1e-9:
+            last["end"] = max(le, e)
+        else:
+            out.append({"start": s, "end": e})
+    return out
+
+
+def sleep_wake_global_intervals(
+    annotations: list[dict[str, Any]],
+    sleep_start_markers: list[str],
+    wake_start_markers: list[str],
+    *,
+    t_end_sec: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Глобальные интервалы сна и бодрствования (секунды от начала записи).
+
+    sleep_start_markers — метки начала сна (например «Stage 1»).
+    wake_start_markers — метки начала бодрствования (например «Waking»).
+    Состояние до первого sleep-маркера — бодрствование. Дальше чередование по маркерам.
+
+    Если ни одна аннотация не совпала с маркерами: весь [0, t_end_sec) — бодрствование,
+    список сна пустой.
+    """
+    ss = {_strip_description(s) for s in sleep_start_markers if str(s).strip()}
+    ws = {_strip_description(s) for s in wake_start_markers if str(s).strip()}
+    te = float(t_end_sec)
+    if te <= 0:
+        return [], []
+
+    events: list[tuple[float, str]] = []
+    anns = sorted(annotations, key=lambda a: float(a["onset"]))
+    for ann in anns:
+        desc = _strip_description(str(ann["description"]))
+        t = float(ann["onset"])
+        if t >= te:
+            break
+        if desc in ss:
+            events.append((t, "sleep"))
+        elif desc in ws:
+            events.append((t, "wake"))
+
+    if not events:
+        return [], [{"start": 0.0, "end": te}]
+
+    intervals_sleep: list[dict[str, float]] = []
+    intervals_wake: list[dict[str, float]] = []
+    state = "wake"
+    prev_t = 0.0
+
+    for t, kind in events:
+        if t >= te:
+            break
+        if kind == "sleep" and state == "wake":
+            if t > prev_t:
+                intervals_wake.append({"start": prev_t, "end": t})
+            prev_t = t
+            state = "sleep"
+        elif kind == "wake" and state == "sleep":
+            if t > prev_t:
+                intervals_sleep.append({"start": prev_t, "end": t})
+            prev_t = t
+            state = "wake"
+
+    if state == "wake":
+        if te > prev_t:
+            intervals_wake.append({"start": prev_t, "end": te})
+    else:
+        if te > prev_t:
+            intervals_sleep.append({"start": prev_t, "end": te})
+
+    return (
+        _merge_touching_intervals(intervals_sleep),
+        _merge_touching_intervals(intervals_wake),
+    )
+
+
 def find_annotated_region_bounds_sec(
     annotations: list[dict[str, Any]],
     region_start_markers: list[str],
@@ -220,6 +309,31 @@ def filter_intervals_intersecting_range(
     return out
 
 
+def clip_intervals_to_range(
+    intervals: list[dict[str, Any]],
+    t_lo: float,
+    t_hi: float,
+) -> list[dict[str, Any]]:
+    """
+    Пересечь каждый интервал с [t_lo, t_hi) в глобальных секундах (обрезка границ).
+    В отличие от filter_intervals_intersecting_range, start/end сужаются до окна —
+    суммы длительностей и доли в окне считаются корректно.
+    """
+    out: list[dict[str, Any]] = []
+    for row in intervals:
+        s = float(row["start"])
+        e = float(row["end"])
+        lo = max(s, t_lo)
+        hi = min(e, t_hi)
+        if hi <= lo:
+            continue
+        item: dict[str, Any] = {"start": lo, "end": hi}
+        if "channel" in row:
+            item["channel"] = row["channel"]
+        out.append(item)
+    return out
+
+
 def clip_interval_to_segment(
     start_sec: float,
     end_sec: float,
@@ -254,4 +368,22 @@ def intervals_for_segment(
         else:
             item["channel"] = row.get("channel")
         local.append(item)
+    return local
+
+
+def intervals_for_segment_time_only(
+    intervals: list[dict[str, Any]],
+    seg_tmin: float,
+    seg_tmax: float,
+) -> list[dict[str, float]]:
+    """Как intervals_for_segment, но только start/end (без channel) — для сна/бодрствования."""
+    local: list[dict[str, float]] = []
+    for row in intervals:
+        clip = clip_interval_to_segment(
+            float(row["start"]), float(row["end"]), seg_tmin, seg_tmax
+        )
+        if clip is None:
+            continue
+        ls, le = clip
+        local.append({"start": ls, "end": le})
     return local

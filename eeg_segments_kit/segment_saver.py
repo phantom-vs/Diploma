@@ -18,11 +18,14 @@ from preprocessor import (
     apply_label_pipeline,
     depd_intervals_from_annotations,
     filter_dep_like_annotation_dicts,
+    clip_intervals_to_range,
     filter_intervals_intersecting_range,
     find_annotated_region_bounds_sec,
     global_intervals_from_markers,
     intervals_for_segment,
+    intervals_for_segment_time_only,
     preprocess_annotation_descriptions,
+    sleep_wake_global_intervals,
 )
 
 
@@ -66,6 +69,19 @@ def _ensure_recording_id(cfg: dict[str, Any]) -> str:
     if rid:
         return rid
     return uuid.uuid4().hex[:12]
+
+
+def _intervals_total_sec(intervals: list[dict[str, Any]]) -> float:
+    return sum(max(0.0, float(r["end"]) - float(r["start"])) for r in intervals)
+
+
+def _mne_set_log_level_quiet() -> Any:
+    """Тише шум MNE (RawArray, bipolar, Reading...). Возвращает уровень для восстановления."""
+    try:
+        return mne.set_log_level("ERROR", return_old_level=True)
+    except TypeError:
+        mne.set_log_level("ERROR")
+        return None
 
 
 BIPOLAR_ANODES = [
@@ -127,6 +143,7 @@ def cropped_raw_to_bipolar_float32(seg_raw: mne.io.BaseRaw) -> tuple[np.ndarray,
         ch_name=names,
         drop_refs=True,
         copy=True,
+        verbose=False,
     )
     raw_bip.pick(names)
     seg_data = raw_bip.get_data().astype(np.float32)
@@ -157,6 +174,10 @@ def export_recording_to_segments(
       - export_only_if_dep_intervals: bool (по умолчанию false) — если true, при отсутствии
         интервалов после парсинга и фильтра окна выбросить ValueError и не писать сегменты.
         Для depd_mode=none не применяется.
+      - sleep_wake_markers: null | {"sleep_start_markers": [...], "wake_start_markers": [...]}
+        — границы сна/бодрствования по тексту аннотаций (после label_pipeline).
+        Если ключ отсутствует или null — маркеры по умолчанию «Stage 1» и «Waking».
+        Пустые списки в объекте: ни одна метка не совпадает → весь отрезок бодрствование.
       - recording_id, dataset, subject_id, session_date, tags — для манифеста
     """
     eeg_path = Path(eeg_path).expanduser().resolve()
@@ -175,6 +196,7 @@ def export_recording_to_segments(
     recording_id = _ensure_recording_id(cfg)
 
     raw = read_raw_nihon(eeg_path, preload=False)
+    _mne_log_prev = _mne_set_log_level_quiet()
     try:
         sfreq = float(raw.info["sfreq"])
         n_times = int(raw.n_times)
@@ -189,18 +211,22 @@ def export_recording_to_segments(
         t_crop_lo: float = 0.0
         t_crop_hi: float = duration_sec
         region_window_active = False
+        region_end_marker_found = False
+        region_markers_configured = False
         if region_cfg:
             s_markers = list(region_cfg.get("start_markers") or [])
             e_markers = list(region_cfg.get("end_markers") or [])
             required = bool(region_cfg.get("required", False))
             require_end_marker = bool(region_cfg.get("require_end_marker", False))
             if s_markers and e_markers:
+                region_markers_configured = True
                 ts, te, end_found = find_annotated_region_bounds_sec(
                     piped,
                     s_markers,
                     e_markers,
                     total_duration_sec=duration_sec,
                 )
+                region_end_marker_found = bool(end_found)
                 if ts is None:
                     if required:
                         raise ValueError(
@@ -220,6 +246,29 @@ def export_recording_to_segments(
 
         t_crop_hi = min(t_crop_hi, t_max_raw)
         t_crop_lo = min(max(0.0, t_crop_lo), t_max_raw)
+
+        if region_window_active:
+            end_note = (
+                "Метка конца разметки найдена."
+                if region_end_marker_found
+                else "Метка конца не найдена — верхняя граница по концу записи."
+            )
+            print(
+                "[экспорт] Обнаружены границы разметки (annotated_region): "
+                f"{t_crop_lo:.3f} … {t_crop_hi:.3f} с "
+                f"({(t_crop_hi - t_crop_lo) / 60.0:.2f} мин). "
+                f"Сохраняется только этот фрагмент. {end_note}"
+            )
+        elif region_markers_configured:
+            print(
+                "[экспорт] В конфиге заданы start/end разметки, но начало не найдено "
+                "— экспортируется вся запись в пределах файла."
+            )
+        else:
+            print(
+                "[экспорт] Окно разметки по меткам не задано — "
+                "экспорт по всей длине записи (в пределах файла)."
+            )
 
         intervals_by_channel: list[dict[str, Any]] = []
         intervals_global: list[dict[str, Any]] = []
@@ -245,6 +294,40 @@ def export_recording_to_segments(
             intervals_global = filter_intervals_intersecting_range(
                 intervals_global, t_crop_lo, t_crop_hi
             )
+
+        sw_cfg = cfg.get("sleep_wake_markers")
+        if sw_cfg is None:
+            sm_sl, sm_wk = ["Stage 1"], ["Waking"]
+        else:
+            sm_sl = list((sw_cfg or {}).get("sleep_start_markers") or [])
+            sm_wk = list((sw_cfg or {}).get("wake_start_markers") or [])
+        sleep_wake_marker_sets = {"sleep_start_markers": sm_sl, "wake_start_markers": sm_wk}
+        intervals_sleep_g, intervals_wake_g = sleep_wake_global_intervals(
+            piped,
+            sm_sl,
+            sm_wk,
+            t_end_sec=t_max_raw,
+        )
+        # Обрезаем по окну экспорта (а не только «пересекающиеся с окном» с длиной по всей записи)
+        intervals_sleep_g = clip_intervals_to_range(
+            intervals_sleep_g, t_crop_lo, t_crop_hi
+        )
+        intervals_wake_g = clip_intervals_to_range(
+            intervals_wake_g, t_crop_lo, t_crop_hi
+        )
+
+        sleep_sec = _intervals_total_sec(intervals_sleep_g)
+        wake_sec = _intervals_total_sec(intervals_wake_g)
+        crop_span = max(0.0, t_crop_hi - t_crop_lo)
+        sleep_pct = (100.0 * sleep_sec / crop_span) if crop_span > 1e-9 else 0.0
+        print(
+            "[экспорт] Сон / бодрствование (внутри окна экспорта): "
+            f"сон — {len(intervals_sleep_g)} интерв., суммарно {sleep_sec:.1f} с "
+            f"({sleep_pct:.1f}% длины окна); "
+            f"бодрствование — {len(intervals_wake_g)} интерв., суммарно {wake_sec:.1f} с. "
+            f"Маркеры: сон {sleep_wake_marker_sets['sleep_start_markers']!r}, "
+            f"пробуждение {sleep_wake_marker_sets['wake_start_markers']!r}."
+        )
 
         if bool(cfg.get("export_only_if_dep_intervals", False)):
             if depd_mode == "by_channel" and not intervals_by_channel:
@@ -273,7 +356,9 @@ def export_recording_to_segments(
             npz_abs = out_dir / npz_rel
             meta_abs = out_dir / meta_rel
 
-            seg_raw = raw.copy().crop(tmin=t, tmax=t1).load_data()
+            seg_raw = raw.copy().crop(tmin=t, tmax=t1, verbose=False).load_data(
+                verbose=False
+            )
             try:
                 seg_data, seg_ch_names = cropped_raw_to_bipolar_float32(seg_raw)
 
@@ -288,6 +373,12 @@ def export_recording_to_segments(
 
                 seg_intervals_ch = intervals_for_segment(intervals_by_channel, t, t1)
                 seg_intervals_gl = intervals_for_segment(intervals_global, t, t1)
+                seg_intervals_sleep = intervals_for_segment_time_only(
+                    intervals_sleep_g, t, t1
+                )
+                seg_intervals_wake = intervals_for_segment_time_only(
+                    intervals_wake_g, t, t1
+                )
 
                 meta = {
                     "version": 1,
@@ -311,6 +402,9 @@ def export_recording_to_segments(
                     "depd_mode": depd_mode,
                     "intervals_by_channel": seg_intervals_ch,
                     "intervals_global": seg_intervals_gl,
+                    "sleep_wake_markers": sleep_wake_marker_sets,
+                    "intervals_sleep": seg_intervals_sleep,
+                    "intervals_wake": seg_intervals_wake,
                     "annotated_region_sec": [t_crop_lo, t_crop_hi],
                 }
                 with meta_abs.open("w", encoding="utf-8") as mf:
@@ -349,6 +443,8 @@ def export_recording_to_segments(
             json.dump(manifest, mf, ensure_ascii=False, indent=2)
         return man_path
     finally:
+        if _mne_log_prev is not None:
+            mne.set_log_level(_mne_log_prev)
         del raw
 
 
