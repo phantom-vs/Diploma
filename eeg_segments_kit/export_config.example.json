@@ -1,0 +1,32 @@
+{
+  "recording_id": "",
+  "dataset": "example_dataset",
+  "subject_id": "none",
+  "session_date": "none",
+  "tags": {
+    "site": "NKT",
+    "device": "EEG2100"
+  },
+  "export_only_if_dep_intervals": true,
+  "segment_duration_sec": 300,
+  "label_pipeline": [
+    "spaces_to_commas",
+    "collapse_duplicate_commas",
+    "expand_merged_channels_ge19"
+  ],
+  "depd_mode": "by_channel",
+  "depd_global_markers": {
+    "start_markers": ["начало_дэпд", "DEPD_START"],
+    "end_markers": ["конец_дэпд", "DEPD_END"]
+  },
+  "annotated_region": {
+    "start_markers": ["Начало разметки", "MARKUP_REGION_START", "START"],
+    "end_markers": ["Конец разметки", "MARKUP_REGION_END", "END"],
+    "required": false,
+    "require_end_marker": false
+  },
+  "sleep_wake_markers": {
+    "sleep_start_markers": ["Stage 1", "Stage,1"],
+    "wake_start_markers": ["Waking"]
+  }
+}
